@@ -1,6 +1,6 @@
 name: astrbot_plugin_command_router
 display_name: 智能指令路由器
-desc: 基于AI的自然语言指令解析，允许用户使用自然语言调用 AstrBot 中已注册的指令。
-version: v1.5.0
+desc: 明日方舟 MAA 自然语言任务路由，支持 daily、指定关卡、理智药数量及任务组合
+version: v1.5.0-ones.1
 author: PyuraMazo
-repo: https://github.com/PyuraMazo/astrbot_plugin_command_router
+repo: https://github.com/TrivialHe/astrbot_plugin_command_router

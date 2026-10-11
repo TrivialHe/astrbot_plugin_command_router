@@ -1,3 +1,23 @@
+# Ones MAA 维护版
+
+这是 TrivialHe 针对本机 AstrBot → n8n → maa-cli 工作流维护的 fork。保留原作者与 AGPL-3.0 许可证；上游说明保留在本文末尾。
+
+只路由 `astrbot_plugin_n8n:maa`，需安装 [MAA 桥接维护版](https://github.com/TrivialHe/astrbot_plugin_n8n)。明确执行请求才会路由；模型无法擅自增加药量或关卡。模糊药量先追问，五分钟内可补全或取消。
+
+在插件配置中将 `allowed_senders` 填为 `平台ID|发送者UID` 列表，默认为空；配置会话模型或 `text_provider_id`。请按自己的平台填写，不要复制他人的标识。
+
+隔离验证需要两个仓库作为同级目录，不挂载生产配置、不连接网络：
+
+```sh
+docker run --rm --network none --read-only --tmpfs /tmp --tmpfs /AstrBot/data \
+  -v "$PWD:/review:ro" --entrypoint python soulter/astrbot:latest \
+  /review/astrbot_plugin_command_router/test_runtime.py
+```
+
+此 fork 属于个人工作流适配，不向原仓库提交 PR。
+
+---
+
 # 智能指令路由器
 
 一个基于人工智能的自然语言指令解析插件，允许用户使用自然语言调用 AstrBot 中已注册的任何指令。

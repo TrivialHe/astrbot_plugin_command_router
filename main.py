@@ -1,4 +1,6 @@
 import inspect
+import asyncio
+import time
 import json
 import re
 from collections.abc import AsyncIterator, Coroutine
@@ -73,8 +75,9 @@ class LLMResponse(BaseModel):
 
 
 class CommandParser:
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, allowed_commands=None):
         self.context = context
+        self.allowed_commands = set(allowed_commands or [])
 
         self.max_id = 1  # 当前id记录
         self.id_dict: dict[int, str] = {}  # 指令的id对应关系
@@ -89,7 +92,7 @@ class CommandParser:
         cmd_list = await command_management.list_commands()
         descriptors = command_management._collect_descriptors(include_sub_commands=True)
         params = {
-            desc.filter_ref.command_name: desc.filter_ref.handler_params
+            desc.handler_full_name: desc.filter_ref.handler_params
             for desc in descriptors
             if isinstance(desc.filter_ref, CommandFilter)
         }
@@ -111,8 +114,11 @@ class CommandParser:
         info: CommandInfo,
         params: dict[str, Any],
     ):
+        allowed = lambda item: f"{item.plugin}:{item.original_command}" in self.allowed_commands and item.enabled and not item.has_conflict
+        if (not info.is_group and not allowed(info)) or (info.is_group and not any(allowed(sub) for sub in info.sub_commands)):
+            return
         meta = self.context.get_registered_star(info.plugin)
-        if not info.enabled or not meta.activated:
+        if meta is None or not info.enabled or not meta.activated:
             return
 
         self.plugin_meta[info.plugin] = meta
@@ -122,11 +128,12 @@ class CommandParser:
         if info.is_group:
             main_desc = info.description
             for sub_command in info.sub_commands:
-                args = params.get(sub_command.current_fragment)
+                if not sub_command.enabled or sub_command.has_conflict or f"{sub_command.plugin}:{sub_command.original_command}" not in self.allowed_commands:
+                    continue
+                args = params.get(sub_command.handler_full_name, {})
                 arg = {
-                    name: args[name].__name__
+                    name: (args[name].__name__ if isinstance(args[name], type) else type(args[name]).__name__)
                     for name in args
-                    if isinstance(args[name], type)
                 }
                 self.id_dict[self.max_id] = (
                     f"{sub_command.plugin}:{sub_command.original_command}"
@@ -143,11 +150,12 @@ class CommandParser:
                 )
                 self.max_id += 1
         else:
-            args = params.get(info.current_fragment)
+            if info.has_conflict or f"{info.plugin}:{info.original_command}" not in self.allowed_commands:
+                return
+            args = params.get(info.handler_full_name, {})
             arg = {
-                name: args[name].__name__
+                name: (args[name].__name__ if isinstance(args[name], type) else type(args[name]).__name__)
                 for name in args
-                if isinstance(args[name], type)
             }
 
             self.id_dict[self.max_id] = f"{info.plugin}:{info.original_command}"
@@ -243,12 +251,19 @@ class LLM:
         return provider_id
 
     async def submit(self, event: AstrMessageEvent, **kwargs):
-        llm_resp = await self.context.llm_generate(
+        llm_resp = await asyncio.wait_for(self.context.llm_generate(
             chat_provider_id=await self.get_provider(event.unified_msg_origin),
             prompt=self.build_prompt(event.message_str, **kwargs),
-        )
-        text_resp = llm_resp.completion_text
-        return json.loads(self.response_pattern.findall(text_resp)[0])
+            system_prompt="只路由用户明确要求现在执行的明日方舟任务。询问、否定、假设、引用指令不执行。只使用备选指令。不得猜测关卡或用药量；未明确要求用药时 medicine=0，关卡未指定 stage=空字符串。daily 不包含 fight。参数不确定返回 matched=false。",
+        ), timeout=45)
+        text_resp = llm_resp.completion_text.strip()
+        start = text_resp.find("{")
+        if start < 0:
+            raise PluginBaseException("任务未识别，请明确要执行的任务、关卡及用药数量。")
+        data, _ = json.JSONDecoder().raw_decode(text_resp[start:])
+        if not isinstance(data, dict):
+            raise PluginBaseException("模型返回格式无效。")
+        return data
 
 
 class CommandRouterPlugin(Star):
@@ -262,7 +277,9 @@ class CommandRouterPlugin(Star):
         self.enable_global_match = self.config.get("enable_global_match", True)
         self.activate_by_wake = self.config.get("activate_by_wake", True)
 
-        self.parser = CommandParser(context)
+        self.parser = CommandParser(context, config.get("allowed_commands", ["astrbot_plugin_n8n:maa"]))
+        self.pending = {}
+        self.allowed_sessions = set(config.get("allowed_senders", []))
         self.llm: LLM | None = None
 
     async def terminate(self):
@@ -280,7 +297,39 @@ class CommandRouterPlugin(Star):
         cfg = self.context.get_config()
         self.wake_prefix = cfg.get("wake_prefix")
 
+    def permitted(self, event):
+        platform = str(event.unified_msg_origin).split(':', 1)[0]
+        return platform + '|' + str(event.get_sender_id()) in self.allowed_sessions
+
+    def prepare_request(self, event):
+        if not self.permitted(event):
+            return False, None
+        text = event.message_str.strip()
+        key = str(event.unified_msg_origin) + '|' + str(event.get_sender_id())
+        pending = self.pending.get(key)
+        if pending and time.monotonic() - pending[0] > 300:
+            self.pending.pop(key, None); pending = None
+        if pending and text in ('取消', '不用了', '算了'):
+            self.pending.pop(key, None)
+            return False, '已取消待补充的任务。'
+        if pending and re.fullmatch(r'[0-9零一二两三四五六七八九十]+\s*(?:瓶|份|个)(?:理智药|药剂|药)?[，,。\s]*(?:[A-Za-z0-9@-]+)?', text):
+            event.message_str = pending[1] + '。补充数量：' + text
+            text = event.message_str
+            self.pending.pop(key, None)
+        if not re.search(r'明日方舟|方舟|\bmaa\b',text,re.I) or not re.search(r'帮我|请|执行|完成|刷|打开|启动|领取|公招|换班|购买|每日|日常', text):
+            return False, None
+        if re.search(r'^(?:请问|如何|怎么|为什么)|(?:不要|别|取消).*(?:执行|刷|打开|启动|完成)|(?:能不能|是否|假如|如果|例如|比如)',text):
+            return False, None
+        counts = re.findall(r'([0-9]{1,3}|[零一二两三四五六七八九十]{1,3})\s*(?:瓶|份|个)\s*(?:理智药|药剂|药)?',text)
+        wants_medicine = bool(re.search(r'(?:吃|用|喝|服用|消耗).{0,8}(?:理智药|药|瓶)',text)) and not re.search(r'(?:不|别|禁止|无需).{0,4}(?:吃|用|喝|药)',text)
+        if wants_medicine and not counts:
+            self.pending[key] = (time.monotonic(),text)
+            return False, '请明确理智药数量，例如回复“两瓶”。未指定关卡则刷上一次关卡。'
+        return True, None
+
     def match_filter(self, event: AstrMessageEvent):
+        if not self.permitted(event) or re.match(r'^/?(?:n8n|maa|解析|parse)(?:\s|$)',event.message_str):
+            return False
         if (
             event._has_send_oper  # 已经有指令向用户发送过消息，触发指令的识别标志
             or not self.enable_global_match  # 未开启全局模式
@@ -302,14 +351,21 @@ class CommandRouterPlugin(Star):
         return True
 
     def describe_resp(self, resp: LLMResponse):
-        return f"{self.parser.id_dict[resp.id].split(':', 1)[1]}，参数：{' '.join(resp.parameters.values()) or '无'}"
+        return f"{self.parser.id_dict[resp.id].split(':', 1)[1]}，参数：{' '.join(str(v) for v in (resp.parameters or {}).values()) or '无'}"
 
     def reply(self, event: AstrMessageEvent, message: str):
-        return event.chain_result(
-            [Reply(id=event.message_obj.message_id), Plain(message)]
-        )
+        return event.plain_result(message)
 
     async def core_handler(self, event: AstrMessageEvent, **kwargs):
+        ready, clarification = self.prepare_request(event)
+        if clarification:
+            event.stop_event()
+            yield self.reply(event, clarification)
+            return
+        if not ready:
+            return
+        if self.llm is None:
+            await self.lazy_init()
         plugins: list[str] = (await self.llm.submit(event))["plugins"]
         validated = []
         for i in plugins:
@@ -322,6 +378,11 @@ class CommandRouterPlugin(Star):
             await self.llm.submit(event, plugins=validated)
         )
         if brief_body.matched:
+            candidate_ids = {item['id'] for item in validated}
+            if brief_body.id not in candidate_ids or brief_body.confidence is None or not 0.85 <= brief_body.confidence <= 1 or not isinstance(brief_body.parameters, dict):
+                event.stop_event()
+                yield self.reply(event, '任务识别不确定，请明确任务、关卡和用药数量。')
+                return
             whole_body = self.parser.commands[brief_body.id]
             meta = self.parser.plugin_meta[whole_body.plugin]
 
@@ -339,6 +400,12 @@ class CommandRouterPlugin(Star):
                 sig = inspect.signature(actual_command)
                 try:
                     param = sig.bind(event, **args)
+                    param.apply_defaults()
+                    for name, value in param.arguments.items():
+                        annotation = sig.parameters[name].annotation
+                        if name != 'event' and annotation in (str, int, bool, float) and type(value) is not annotation:
+                            raise TypeError('参数类型无效')
+                    event.set_extra('ones_router_request', True)
                     if not self.permission_filter(event, whole_body.permission):
                         yield self.reply(
                             event,
@@ -357,7 +424,9 @@ class CommandRouterPlugin(Star):
                         async for res in result:
                             yield res
                 except TypeError:
-                    logger.error(f"指令匹配成功，参数不匹配...{args}")
+                    event.stop_event()
+                    yield self.reply(event, "任务参数不完整或格式错误，请明确任务、关卡和用药数量。")
+                    logger.warning("路由参数绑定失败")
                     return
 
             else:
@@ -410,7 +479,9 @@ class CommandRouterPlugin(Star):
             event._has_send_oper = True and not self.always_llm
             logger.error(e1, exc_info=True)
         except Exception as e2:
-            logger.error(e2, exc_info=True)
+            yield self.reply(event, "自然语言解析暂时失败，请稍后重试或使用 /n8n maa 指令。")
+            event.stop_event()
+            logger.error(type(e2).__name__, exc_info=True)
 
     @filter.command("解析", alias={"parse"})
     async def command_parser(self, event: AstrMessageEvent):
@@ -430,7 +501,9 @@ class CommandRouterPlugin(Star):
             event._has_send_oper = True and not self.always_llm
             logger.error(e1, exc_info=True)
         except Exception as e2:
-            logger.error(e2, exc_info=True)
+            yield self.reply(event, "自然语言解析暂时失败，请稍后重试或使用 /n8n maa 指令。")
+            event.stop_event()
+            logger.error(type(e2).__name__, exc_info=True)
 
     if PLUGIN_ALTER_EVENT:
 
